@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Free Fire Info Checker — Telegram Bot (Render-ready) v2.5
-Improvements:
-- UID extraction is now precise: prefers uid/playerid in trusted sections (basicinfo/profileinfo/clanbasicinfo)
-  and avoids misleading generic ids (e.g., petinfo.id).
-- Likes extraction improved: detects likes/likecount across socialinfo/basicinfo/profileinfo and coerces numbers.
-- Still uses HTML parse mode (no Markdown parsing errors).
-- Recursive parsing across nested sections.
-- /start, webhook test route, lifespan webhook setup, __main__ uvicorn runner.
+Free Fire Info Checker — Telegram Bot (Render-ready) v2.6
+Updates:
+- UID: only accept from trusted keys (uid/playeruid/playerid/player_id) inside trusted sections
+  and never from petinfo/diamondcostres/creditscoreinfo; otherwise fall back to the queried UID.
+- Likes: expanded synonyms and improved numeric parsing.
+- HTML parse mode, recursive parsing, lifespan webhook, /start, webhook test, __main__ runner.
 """
 import html
 import json
@@ -113,7 +111,10 @@ def _search_all(obj: Any, want: set[str], path: str = "") -> List[Tuple[Any, str
     return hits
 
 TRUST_SECTIONS_UID = ("basicinfo", "profileinfo", "clanbasicinfo")
+BAN_SECTIONS_UID = ("petinfo", "diamondcost", "diamondcostres", "creditscoreinfo")
+
 TRUST_SECTIONS_LIKES = ("socialinfo", "basicinfo", "profileinfo")
+BAN_SECTIONS_LIKES = ("petinfo", "diamondcost", "diamondcostres", "creditscoreinfo")
 
 def _to_str(val: Any) -> str:
     try:
@@ -123,17 +124,12 @@ def _to_str(val: Any) -> str:
     except Exception:
         return str(val)
 
-def _coerce_int(s: str) -> str:
-    try:
-        # extract digits and convert
-        digits = re.sub(r"[^\d]", "", str(s))
-        if digits == "":
-            return s
-        return str(int(digits))
-    except Exception:
-        return s
+def _coerce_int_like(s: str) -> str:
+    # keep signless integer, remove separators
+    digits = re.sub(r"[^\d]", "", str(s))
+    return digits if digits != "" else str(s)
 
-def pick_best(obj: Any, keys: List[str], trust_sections: Tuple[str, ...], penalize_sections: Tuple[str, ...] = ()) -> Tuple[str, Optional[str]]:
+def pick_best(obj: Any, keys: List[str], trust_sections: Tuple[str, ...], penalize_sections: Tuple[str, ...] = (), disallow_generic_id: bool = False) -> Tuple[str, Optional[str]]:
     want = {_norm(k) for k in keys}
     hits = _search_all(obj, want)
     if not hits:
@@ -141,15 +137,16 @@ def pick_best(obj: Any, keys: List[str], trust_sections: Tuple[str, ...], penali
     order = { _norm(k): i for i,k in enumerate(keys) }
     def score(item):
         val, path, nk = item
-        s = 100 - order.get(nk, 50)  # earlier key => higher base
         pl = path.lower()
-        if any(sec in pl for sec in trust_sections):
-            s += 80
+        # disallow from banned sections
         if any(sec in pl for sec in penalize_sections):
-            s -= 80
-        # penalize generic 'id' to avoid petinfo.id
-        if nk == "id":
-            s -= 70
+            return -9999
+        # if generic id not allowed, drop it
+        if disallow_generic_id and nk == "id":
+            return -9999
+        s = 100 - order.get(nk, 50)
+        if any(sec in pl for sec in trust_sections):
+            s += 200
         return s
     best = max(hits, key=score)
     return _to_str(best[0]), best[1]
@@ -158,21 +155,26 @@ def pick_best(obj: Any, keys: List[str], trust_sections: Tuple[str, ...], penali
 def h(s: str) -> str:
     return html.escape(s or "")
 
-def format_player_info(data: Dict[str, Any]) -> str:
+def format_player_info(data: Dict[str, Any], queried_uid: str) -> str:
     root = data.get("data") if isinstance(data.get("data"), dict) else data
 
-    nickname, w1 = pick_best(root, ["nickname","name","playername","ign"], TRUST_SECTIONS_UID)
-    uid, w2      = pick_best(root, ["uid","playeruid","playerid","player_id","id"], TRUST_SECTIONS_UID, penalize_sections=("petinfo","creditscoreinfo","diamondcost"))
-    level, w3    = pick_best(root, ["level","playerlevel"], TRUST_SECTIONS_UID)
-    region, w4   = pick_best(root, ["region","server"], TRUST_SECTIONS_UID)
-    rank_, w5    = pick_best(root, ["rank","tier","ranktier"], TRUST_SECTIONS_UID)
-    # likes: prefer socialinfo/basicinfo and coerce to number-like string
-    likes, w6    = pick_best(root, ["likes","like","likecount","like_count"], TRUST_SECTIONS_LIKES, penalize_sections=("petinfo","creditscoreinfo","diamondcost"))
-    likes = _coerce_int(likes)
+    nickname, w1 = pick_best(root, ["nickname","name","playername","ign"], TRUST_SECTIONS_UID, BAN_SECTIONS_UID)
+    # Strict UID: do NOT accept generic 'id'; prefer trusted sections only
+    uid, w2      = pick_best(root, ["uid","playeruid","playerid","player_id"], TRUST_SECTIONS_UID, BAN_SECTIONS_UID, disallow_generic_id=True)
+    if uid == "—" or not re.fullmatch(r"\d{6,20}", re.sub(r"[^\d]", "", uid)):
+        uid = queried_uid
+        w2 = "fallback: queried uid"
 
-    guild, w7    = pick_best(root, ["guild","clan","guildname","clanname"], TRUST_SECTIONS_UID)
-    country, w8  = pick_best(root, ["country","nationality","regionname","countryname"], TRUST_SECTIONS_UID)
-    bio, w9      = pick_best(root, ["signature","bio","about","status"], TRUST_SECTIONS_LIKES)
+    level, w3    = pick_best(root, ["level","playerlevel"], TRUST_SECTIONS_UID, BAN_SECTIONS_UID)
+    region, w4   = pick_best(root, ["region","server","regionname","countryname"], TRUST_SECTIONS_UID, BAN_SECTIONS_UID)
+    rank_, w5    = pick_best(root, ["rank","tier","ranktier"], TRUST_SECTIONS_UID, BAN_SECTIONS_UID)
+
+    likes, w6    = pick_best(root, ["likes","like","likecount","like_count","praise","praises","praisecount","zan","zancnt","thumbsup","thumbs_up","popularity"], TRUST_SECTIONS_LIKES, BAN_SECTIONS_LIKES)
+    likes = _coerce_int_like(likes)
+
+    guild, w7    = pick_best(root, ["guild","clan","guildname","clanname"], TRUST_SECTIONS_UID, BAN_SECTIONS_UID)
+    country, w8  = pick_best(root, ["country","nationality","regionname","countryname"], TRUST_SECTIONS_UID, BAN_SECTIONS_UID)
+    bio, w9      = pick_best(root, ["signature","bio","about","status"], TRUST_SECTIONS_LIKES, BAN_SECTIONS_LIKES)
 
     parts = [
         "<b>🟢 Free Fire Player Info</b>",
@@ -274,7 +276,7 @@ async def telegram_webhook(req: Request):
         server = cmd["server"]
         try:
             data = await fetch_player(uid, server)
-            msg = format_player_info(data)
+            msg = format_player_info(data, queried_uid=uid)
         except HTTPException as e:
             msg = f"⚠️ Error: {html.escape(str(e.detail))}"
         await tg_request("sendMessage", {
