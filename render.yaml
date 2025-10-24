@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: freefire-telegram-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: DEFAULT_SERVER
+        value: sg
+    healthCheckPath: /healthz
