@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Free Fire Info Checker — Telegram Bot (Render-ready) v2.4
-Fixes:
-- Telegram formatting error by using HTML parse mode + safe escaping.
-- Keeps recursive parsing across nested sections (basicinfo/profileinfo/...).
-- Adds /start, GET /webhook/<secret>/test, lifespan webhook setup, and __main__ runner.
+Free Fire Info Checker — Telegram Bot (Render-ready) v2.5
+Improvements:
+- UID extraction is now precise: prefers uid/playerid in trusted sections (basicinfo/profileinfo/clanbasicinfo)
+  and avoids misleading generic ids (e.g., petinfo.id).
+- Likes extraction improved: detects likes/likecount across socialinfo/basicinfo/profileinfo and coerces numbers.
+- Still uses HTML parse mode (no Markdown parsing errors).
+- Recursive parsing across nested sections.
+- /start, webhook test route, lifespan webhook setup, __main__ uvicorn runner.
 """
 import html
 import json
 import logging
 import os
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 from contextlib import asynccontextmanager
 
 import httpx
@@ -28,7 +31,6 @@ if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
 if not WEBHOOK_SECRET:
     raise RuntimeError("WEBHOOK_SECRET is not set")
-# PUBLIC_URL optional (used to auto-set webhook)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 API_BASE = "https://yunus-freefire-api.onrender.com/get_player_personal_show"
@@ -38,7 +40,6 @@ logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: auto-set webhook if PUBLIC_URL provided
     if PUBLIC_URL:
         webhook_url = f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"
         payload = {"url": webhook_url, "allowed_updates": ["message", "edited_message"]}
@@ -96,57 +97,82 @@ async def fetch_player(uid: str, server: str) -> Dict[str, Any]:
 def _norm(s: str) -> str:
     return s.replace("_", "").replace("-", "").lower()
 
-def _search(obj: Any, want: set[str], path: str = ""):
-    """Depth-first search for any key in 'want'. Returns (value, path) | None"""
+def _search_all(obj: Any, want: set[str], path: str = "") -> List[Tuple[Any, str, str]]:
+    """Return all (value, path, matched_key_norm) occurrences depth-first."""
+    hits: List[Tuple[Any, str, str]] = []
     if isinstance(obj, dict):
         for k, v in obj.items():
             nk = _norm(k)
             if nk in want:
-                return v, f"{path}.{k}" if path else k
-        # search recursively
+                hits.append((v, f"{path}.{k}" if path else k, nk))
         for k, v in obj.items():
-            sub = _search(v, want, f"{path}.{k}" if path else k)
-            if sub:
-                return sub
+            hits.extend(_search_all(v, want, f"{path}.{k}" if path else k))
     elif isinstance(obj, list):
         for idx, item in enumerate(obj):
-            sub = _search(item, want, f"{path}[{idx}]")
-            if sub:
-                return sub
-    return None
+            hits.extend(_search_all(item, want, f"{path}[{idx}]"))
+    return hits
 
-def find_first(obj: Any, keys: list[str]):
-    want = {_norm(k) for k in keys}
-    found = _search(obj, want)
-    if not found:
-        return "—", None
-    val, where = found
+TRUST_SECTIONS_UID = ("basicinfo", "profileinfo", "clanbasicinfo")
+TRUST_SECTIONS_LIKES = ("socialinfo", "basicinfo", "profileinfo")
+
+def _to_str(val: Any) -> str:
     try:
         if isinstance(val, (dict, list)):
-            s = json.dumps(val, ensure_ascii=False)[:200]
-        else:
-            s = str(val)
+            return json.dumps(val, ensure_ascii=False)[:200]
+        return str(val)
     except Exception:
-        s = str(val)
-    return s, where
+        return str(val)
+
+def _coerce_int(s: str) -> str:
+    try:
+        # extract digits and convert
+        digits = re.sub(r"[^\d]", "", str(s))
+        if digits == "":
+            return s
+        return str(int(digits))
+    except Exception:
+        return s
+
+def pick_best(obj: Any, keys: List[str], trust_sections: Tuple[str, ...], penalize_sections: Tuple[str, ...] = ()) -> Tuple[str, Optional[str]]:
+    want = {_norm(k) for k in keys}
+    hits = _search_all(obj, want)
+    if not hits:
+        return "—", None
+    order = { _norm(k): i for i,k in enumerate(keys) }
+    def score(item):
+        val, path, nk = item
+        s = 100 - order.get(nk, 50)  # earlier key => higher base
+        pl = path.lower()
+        if any(sec in pl for sec in trust_sections):
+            s += 80
+        if any(sec in pl for sec in penalize_sections):
+            s -= 80
+        # penalize generic 'id' to avoid petinfo.id
+        if nk == "id":
+            s -= 70
+        return s
+    best = max(hits, key=score)
+    return _to_str(best[0]), best[1]
 
 # --- Formatting (HTML-safe) ---
 def h(s: str) -> str:
     return html.escape(s or "")
 
 def format_player_info(data: Dict[str, Any]) -> str:
-    # Prefer nested "data" if present
     root = data.get("data") if isinstance(data.get("data"), dict) else data
 
-    nickname, w1 = find_first(root, ["nickname", "name", "playername", "ign"])
-    uid, w2 = find_first(root, ["uid", "playerid", "id"])
-    level, w3 = find_first(root, ["level", "playerlevel"])
-    region, w4 = find_first(root, ["region", "server"])
-    rank_, w5 = find_first(root, ["rank", "tier", "ranktier"])
-    likes, w6 = find_first(root, ["likes", "likecount"])
-    guild, w7 = find_first(root, ["guild", "clan", "guildname", "clanname"])
-    country, w8 = find_first(root, ["country", "nationality"])
-    bio, w9 = find_first(root, ["signature", "bio", "about"])
+    nickname, w1 = pick_best(root, ["nickname","name","playername","ign"], TRUST_SECTIONS_UID)
+    uid, w2      = pick_best(root, ["uid","playeruid","playerid","player_id","id"], TRUST_SECTIONS_UID, penalize_sections=("petinfo","creditscoreinfo","diamondcost"))
+    level, w3    = pick_best(root, ["level","playerlevel"], TRUST_SECTIONS_UID)
+    region, w4   = pick_best(root, ["region","server"], TRUST_SECTIONS_UID)
+    rank_, w5    = pick_best(root, ["rank","tier","ranktier"], TRUST_SECTIONS_UID)
+    # likes: prefer socialinfo/basicinfo and coerce to number-like string
+    likes, w6    = pick_best(root, ["likes","like","likecount","like_count"], TRUST_SECTIONS_LIKES, penalize_sections=("petinfo","creditscoreinfo","diamondcost"))
+    likes = _coerce_int(likes)
+
+    guild, w7    = pick_best(root, ["guild","clan","guildname","clanname"], TRUST_SECTIONS_UID)
+    country, w8  = pick_best(root, ["country","nationality","regionname","countryname"], TRUST_SECTIONS_UID)
+    bio, w9      = pick_best(root, ["signature","bio","about","status"], TRUST_SECTIONS_LIKES)
 
     parts = [
         "<b>🟢 Free Fire Player Info</b>",
@@ -161,7 +187,7 @@ def format_player_info(data: Dict[str, Any]) -> str:
         f"• <b>Bio:</b> {h(bio)}",
     ]
 
-    # Field sources (for debugging)
+    # Field sources (debug)
     where = []
     for label, w in [("nickname", w1), ("uid", w2), ("level", w3), ("region", w4), ("rank", w5), ("likes", w6), ("guild", w7), ("country", w8), ("bio", w9)]:
         if w:
@@ -170,7 +196,6 @@ def format_player_info(data: Dict[str, Any]) -> str:
         parts.append("")
         parts.append("<i>Fields source:</i> " + ", ".join(where))
 
-    # List top sections
     if isinstance(root, dict):
         keys_preview = ", ".join(list(root.keys())[:20])
         if keys_preview:
