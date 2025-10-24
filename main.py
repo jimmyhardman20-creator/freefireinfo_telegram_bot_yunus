@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Free Fire Info Checker — Telegram Bot (Render-ready) v2.3
-- Smarter parsing: recursively searches nested sections (basicinfo, profileinfo, clanbasicinfo, socialinfo, etc.)
-- Shows where each field was found
+Free Fire Info Checker — Telegram Bot (Render-ready) v2.4
+Fixes:
+- Telegram formatting error by using HTML parse mode + safe escaping.
+- Keeps recursive parsing across nested sections (basicinfo/profileinfo/...).
+- Adds /start, GET /webhook/<secret>/test, lifespan webhook setup, and __main__ runner.
 """
+import html
 import json
 import logging
 import os
 import re
 from typing import Any, Dict, Optional, Tuple
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
-from contextlib import asynccontextmanager
 
 # --- Config ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -25,6 +28,7 @@ if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
 if not WEBHOOK_SECRET:
     raise RuntimeError("WEBHOOK_SECRET is not set")
+# PUBLIC_URL optional (used to auto-set webhook)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 API_BASE = "https://yunus-freefire-api.onrender.com/get_player_personal_show"
@@ -34,6 +38,7 @@ logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup: auto-set webhook if PUBLIC_URL provided
     if PUBLIC_URL:
         webhook_url = f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"
         payload = {"url": webhook_url, "allowed_updates": ["message", "edited_message"]}
@@ -64,7 +69,7 @@ async def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         logger.error("Telegram error: %s", data)
     return data
 
-# --- API helper ---
+# --- Upstream API helpers ---
 def build_api_url(uid: str, server: str) -> str:
     from urllib.parse import urlencode
     qs = urlencode({"server": server, "uid": uid})
@@ -88,20 +93,17 @@ async def fetch_player(uid: str, server: str) -> Dict[str, Any]:
     return data
 
 # --- Recursive search utilities ---
-Key = str
-Path = str
-
 def _norm(s: str) -> str:
-    return s.replace("_","").replace("-","").lower()
+    return s.replace("_", "").replace("-", "").lower()
 
-def _search(obj: Any, want: set[str], path: str="") -> Optional[Tuple[Any, Path]]:
-    """Depth-first search for any key in 'want'. Returns (value, path)"""
+def _search(obj: Any, want: set[str], path: str = ""):
+    """Depth-first search for any key in 'want'. Returns (value, path) | None"""
     if isinstance(obj, dict):
         for k, v in obj.items():
             nk = _norm(k)
             if nk in want:
                 return v, f"{path}.{k}" if path else k
-        # search children
+        # search recursively
         for k, v in obj.items():
             sub = _search(v, want, f"{path}.{k}" if path else k)
             if sub:
@@ -113,7 +115,7 @@ def _search(obj: Any, want: set[str], path: str="") -> Optional[Tuple[Any, Path]
                 return sub
     return None
 
-def find_first(obj: Any, keys: list[str]) -> Tuple[str, Optional[str]]:
+def find_first(obj: Any, keys: list[str]):
     want = {_norm(k) for k in keys}
     found = _search(obj, want)
     if not found:
@@ -121,56 +123,61 @@ def find_first(obj: Any, keys: list[str]) -> Tuple[str, Optional[str]]:
     val, where = found
     try:
         if isinstance(val, (dict, list)):
-            # if nested, try to stringify compactly
-            return json.dumps(val, ensure_ascii=False)[:200], where
-        return str(val), where
+            s = json.dumps(val, ensure_ascii=False)[:200]
+        else:
+            s = str(val)
     except Exception:
-        return str(val), where
+        s = str(val)
+    return s, where
 
-# --- Formatting ---
+# --- Formatting (HTML-safe) ---
+def h(s: str) -> str:
+    return html.escape(s or "")
+
 def format_player_info(data: Dict[str, Any]) -> str:
-    # unify: prefer nested "data" if present
+    # Prefer nested "data" if present
     root = data.get("data") if isinstance(data.get("data"), dict) else data
 
-    nickname, w1 = find_first(root, ["nickname","name","playername","ign"])
-    uid, w2       = find_first(root, ["uid","playerid","id"])
-    level, w3     = find_first(root, ["level","playerlevel"])
-    region, w4    = find_first(root, ["region","server"])
-    rank_, w5     = find_first(root, ["rank","tier","ranktier"])
-    likes, w6     = find_first(root, ["likes","likecount"])
-    guild, w7     = find_first(root, ["guild","clan","guildname","clanname"])
-    country, w8   = find_first(root, ["country","nationality"])
-    bio, w9       = find_first(root, ["signature","bio","about"])
+    nickname, w1 = find_first(root, ["nickname", "name", "playername", "ign"])
+    uid, w2 = find_first(root, ["uid", "playerid", "id"])
+    level, w3 = find_first(root, ["level", "playerlevel"])
+    region, w4 = find_first(root, ["region", "server"])
+    rank_, w5 = find_first(root, ["rank", "tier", "ranktier"])
+    likes, w6 = find_first(root, ["likes", "likecount"])
+    guild, w7 = find_first(root, ["guild", "clan", "guildname", "clanname"])
+    country, w8 = find_first(root, ["country", "nationality"])
+    bio, w9 = find_first(root, ["signature", "bio", "about"])
 
-    lines = [
-        "🟢 *Free Fire Player Info*",
-        f"• *Nickname:* {nickname}",
-        f"• *UID:* `{uid}`",
-        f"• *Level:* {level}",
-        f"• *Region/Server:* {region}",
-        f"• *Rank/Tier:* {rank_}",
-        f"• *Likes:* {likes}",
-        f"• *Guild:* {guild}",
-        f"• *Country:* {country}",
-        f"• *Bio:* {bio}",
+    parts = [
+        "<b>🟢 Free Fire Player Info</b>",
+        f"• <b>Nickname:</b> {h(nickname)}",
+        f"• <b>UID:</b> <code>{h(uid)}</code>",
+        f"• <b>Level:</b> {h(level)}",
+        f"• <b>Region/Server:</b> {h(region)}",
+        f"• <b>Rank/Tier:</b> {h(rank_)}",
+        f"• <b>Likes:</b> {h(likes)}",
+        f"• <b>Guild:</b> {h(guild)}",
+        f"• <b>Country:</b> {h(country)}",
+        f"• <b>Bio:</b> {h(bio)}",
     ]
 
-    # show where each field came from (helps debugging current API schema)
+    # Field sources (for debugging)
     where = []
-    for label, w in [("nickname",w1),("uid",w2),("level",w3),("region",w4),("rank",w5),("likes",w6),("guild",w7),("country",w8),("bio",w9)]:
+    for label, w in [("nickname", w1), ("uid", w2), ("level", w3), ("region", w4), ("rank", w5), ("likes", w6), ("guild", w7), ("country", w8), ("bio", w9)]:
         if w:
-            where.append(f"{label}←`{w}`")
+            where.append(f"{label}←<code>{h(w)}</code>")
     if where:
-        lines.append("")
-        lines.append("_Fields source:_ " + ", ".join(where))
+        parts.append("")
+        parts.append("<i>Fields source:</i> " + ", ".join(where))
 
-    # list top-level keys for visibility
-    top_keys = ", ".join(list(root.keys())[:20]) if isinstance(root, dict) else ""
-    if top_keys:
-        lines.append("")
-        lines.append("_Sections available:_ " + top_keys)
+    # List top sections
+    if isinstance(root, dict):
+        keys_preview = ", ".join(list(root.keys())[:20])
+        if keys_preview:
+            parts.append("")
+            parts.append("<i>Sections available:</i> " + h(keys_preview))
 
-    return "\n".join(lines)
+    return "\n".join(parts)
 
 # --- Command parsing ---
 def parse_command(text: str) -> Optional[Dict[str, str]]:
@@ -225,16 +232,16 @@ async def telegram_webhook(req: Request):
         help_text = (
             "Hi! Send your Free Fire UID to get info.\n\n"
             "Commands:\n"
-            "• `/check <uid> [server]` — server default: sg\n"
-            "Example: `/check 123456789 sg`\n\n"
-            "Servers: try `sg`, `in`, `br` (default: sg)\n"
+            "• <b>/check &lt;uid&gt; [server]</b> — server default: sg\n"
+            "Example: <b>/check 123456789 sg</b>\n\n"
+            "Servers: try <code>sg</code>, <code>in</code>, <code>br</code> (default: <code>sg</code>)\n"
         )
-        await tg_request("sendMessage", {"chat_id": chat_id, "text": help_text, "parse_mode": "Markdown"})
+        await tg_request("sendMessage", {"chat_id": chat_id, "text": help_text, "parse_mode": "HTML"})
         return JSONResponse({"ok": True})
 
     if cmd.get("cmd") == "start":
-        msg = "Welcome! Send your Free Fire UID or use `/check <uid> [server]` (default server: sg)."
-        await tg_request("sendMessage", {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+        msg = "Welcome! Send your Free Fire UID or use <b>/check &lt;uid&gt; [server]</b> (default server: <code>sg</code>)."
+        await tg_request("sendMessage", {"chat_id": chat_id, "text": msg, "parse_mode": "HTML"})
         return JSONResponse({"ok": True})
 
     if cmd.get("cmd") == "check":
@@ -244,11 +251,11 @@ async def telegram_webhook(req: Request):
             data = await fetch_player(uid, server)
             msg = format_player_info(data)
         except HTTPException as e:
-            msg = f"⚠️ Error: {e.detail}"
+            msg = f"⚠️ Error: {html.escape(str(e.detail))}"
         await tg_request("sendMessage", {
             "chat_id": chat_id,
             "text": msg,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
             "disable_web_page_preview": True,
         })
         return JSONResponse({"ok": True})
