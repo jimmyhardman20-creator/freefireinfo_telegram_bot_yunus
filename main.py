@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
+from contextlib import asynccontextmanager
 
 # --- Config ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -31,17 +32,35 @@ if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN is not set")
 if not WEBHOOK_SECRET:
     raise RuntimeError("WEBHOOK_SECRET is not set")
-if not PUBLIC_URL:
-    logging.warning("PUBLIC_URL is not set. Webhook will not be auto-configured.")
+# PUBLIC_URL is optional; only needed to auto-set webhook
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 API_BASE = "https://yunus-freefire-api.onrender.com/get_player_personal_show"
 
-# --- App ---
-app = FastAPI()
 logger = logging.getLogger("uvicorn.error")
 logging.basicConfig(level=logging.INFO)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    if PUBLIC_URL:
+        webhook_url = f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"
+        payload = {"url": webhook_url, "allowed_updates": ["message", "edited_message"]}
+        try:
+            res = await tg_request("setWebhook", payload)
+            if not res.get("ok"):
+                logger.error("Failed to set webhook: %s", res)
+            else:
+                logger.info("Webhook set to %s", webhook_url)
+        except Exception as e:
+            logger.error("Error setting webhook on startup: %s", e)
+    else:
+        logger.warning("PUBLIC_URL not set; skipping webhook setup.")
+    yield
+    # Shutdown (no-op)
+
+# --- App ---
+app = FastAPI(lifespan=lifespan)
 
 # --- Helpers ---
 async def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -215,16 +234,7 @@ async def telegram_webhook(req: Request):
     return JSONResponse({"ok": True})
 
 
-@app.on_event("startup")
-async def on_startup():
-    # Configure webhook if PUBLIC_URL is set
-    if not PUBLIC_URL:
-        logger.warning("PUBLIC_URL not set; skipping webhook setup.")
-        return
-    webhook_url = f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}"
-    payload = {"url": webhook_url, "allowed_updates": ["message", "edited_message"]}
-    res = await tg_request("setWebhook", payload)
-    if not res.get("ok"):
-        logger.error("Failed to set webhook: %s", res)
-    else:
-        logger.info("Webhook set to %s", webhook_url)
+if __name__ == "__main__":
+    # Allow running with 'python main.py' (Render sometimes defaults to this)
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
